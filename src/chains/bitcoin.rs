@@ -394,7 +394,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("runtime");
-        let client = super::super::http_client().expect("client");
+        let client = super::super::http_client("history-engine-tests").expect("client");
         let err = runtime
             .block_on(read(&client, "w", &ChainInfo::Bitcoin(btc), OURS))
             .expect_err("must refuse");

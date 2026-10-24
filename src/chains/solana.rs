@@ -313,7 +313,7 @@ mod tests {
     async fn live_history_is_read_from_the_chain() {
         // An active wallet that holds USDC, so both kinds of signature list are asked for.
         let wallet = "CWKMxFufwzFWvSsyVRaDWGC9YJzZzCxsPoPzT1kz3d2M";
-        let client = crate::chains::http_client().unwrap();
+        let client = crate::chains::http_client("history-engine-tests").unwrap();
         let rows = read(&client, "w", &ChainInfo::Solana(chain()), wallet).await.expect("readable");
         for row in rows.iter().take(6) {
             println!("live history: {:?} {} {} (10^-{}) fee {} with {:?}", row.kind, row.amount_base, row.symbol, row.decimals, row.fee_base, row.counterparty);

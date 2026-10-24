@@ -34,7 +34,7 @@ fn ethereum_token_and_native_transfers_are_readable() {
             chain: evm(),
             address: ETH_ADDRESS.into(),
         };
-        let rows = Discovery::new()
+        let rows = Discovery::new("history-engine-tests")
             .expect("client")
             .scan(&target)
             .await
@@ -72,7 +72,7 @@ fn ethereum_amounts_keep_full_precision() {
             chain: evm(),
             address: ETH_ADDRESS.into(),
         };
-        let rows = Discovery::new().expect("client").scan(&target).await.expect("scan");
+        let rows = Discovery::new("history-engine-tests").expect("client").scan(&target).await.expect("scan");
         // Base-unit strings, never floats.
         for row in &rows {
             assert!(
@@ -95,7 +95,7 @@ fn bitcoin_history_has_real_amounts_and_direction() {
             chain: btc(),
             address: BTC_ADDRESS.into(),
         };
-        let rows = Discovery::new().expect("client").scan(&target).await.expect("scan");
+        let rows = Discovery::new("history-engine-tests").expect("client").scan(&target).await.expect("scan");
         println!("bitcoin rows: {}", rows.len());
         assert!(!rows.is_empty());
         assert!(rows.iter().all(|r| r.asset_id == "bitcoin:native"));
@@ -121,7 +121,7 @@ fn bitcoin_history_has_real_amounts_and_direction() {
 fn both_chain_kinds_read_through_the_public_entry_point() {
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     runtime.block_on(async {
-        let discovery = Discovery::new().expect("client");
+        let discovery = Discovery::new("history-engine-tests").expect("client");
         for (chain, address) in [(evm(), ETH_ADDRESS), (btc(), BTC_ADDRESS)] {
             let chain_id = chain.id().to_string();
             let target = ScanTarget {

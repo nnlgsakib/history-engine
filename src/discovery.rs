@@ -27,9 +27,11 @@ pub struct Discovery {
 }
 
 impl Discovery {
-    pub fn new() -> HistoryResult<Discovery> {
+    /// `user_agent` identifies the wallet to the explorers it reads, e.g.
+    /// `"Nira Wallet/1.0 (+https://example.com)"`.
+    pub fn new(user_agent: &str) -> HistoryResult<Discovery> {
         Ok(Discovery {
-            client: chains::http_client()?,
+            client: chains::http_client(user_agent)?,
         })
     }
 
@@ -51,11 +53,5 @@ impl Discovery {
     /// True when this chain can report incoming activity at all.
     pub fn supported(chain: &ChainInfo) -> bool {
         chains::supported(chain)
-    }
-}
-
-impl Default for Discovery {
-    fn default() -> Self {
-        Discovery::new().expect("http client")
     }
 }

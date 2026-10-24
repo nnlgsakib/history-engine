@@ -24,14 +24,16 @@ use std::time::Duration;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Shared HTTP client. One per discovery run: connections are reused, and
-/// public explorer endpoints rate-limit per-connection.
-pub(crate) fn http_client() -> HistoryResult<reqwest::Client> {
+/// public explorer endpoints rate-limit per-connection. `user_agent` names the
+/// wallet making the calls, so explorers can tell one wallet's traffic from
+/// another's.
+pub(crate) fn http_client(user_agent: &str) -> HistoryResult<reqwest::Client> {
     reqwest::Client::builder()
         // Several addresses per name, some unreachable here (IPv6 with no
         // route): each gets a slice of this, then the next is tried.
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(HTTP_TIMEOUT)
-        .user_agent("fnf-wallet")
+        .user_agent(user_agent)
         .build()
         .map_err(|_| crate::error::HistoryError::Source("http client failed".into()))
 }
