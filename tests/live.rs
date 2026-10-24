@@ -1,11 +1,11 @@
 //! Live checks against real public explorers. Not run by `cargo test`.
 //!
-//! Run: cargo test -p fnf-history --test live -- --ignored --nocapture
+//! Run: cargo test -p history-engine --test live -- --ignored --nocapture
 //!
 //! These hit the network. They exist so a wire-format change or a renamed
 //! endpoint is caught here rather than as an empty activity list on a device.
 
-use fnf_history::discovery::{Discovery, ScanTarget};
+use history_engine::discovery::{Discovery, ScanTarget};
 use registry::model::{BitcoinChain, ChainInfo, EvmChain};
 
 const ETHEREUM: &str = include_str!("../../registry/data/evm/1.json");
@@ -56,7 +56,7 @@ fn ethereum_token_and_native_transfers_are_readable() {
             "token transfers must be read from token-transfers"
         );
         assert!(
-            rows.iter().any(|r| r.kind == fnf_history::HistoryKind::Received),
+            rows.iter().any(|r| r.kind == history_engine::HistoryKind::Received),
             "expected at least one incoming transfer"
         );
     });
@@ -109,8 +109,8 @@ fn bitcoin_history_has_real_amounts_and_direction() {
             "bitcoin rows must carry derived amounts, not zeros"
         );
         assert!(
-            rows.iter().all(|r| r.kind == fnf_history::HistoryKind::Sent
-                || r.kind == fnf_history::HistoryKind::Received),
+            rows.iter().all(|r| r.kind == history_engine::HistoryKind::Sent
+                || r.kind == history_engine::HistoryKind::Received),
             "direction must be derived from inputs and outputs"
         );
     });

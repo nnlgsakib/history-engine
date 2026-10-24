@@ -1,8 +1,8 @@
 [package]
-name = "fnf-history"
+name = "history-engine"
 version = "0.1.0"
 edition = "2021"
-description = "Transaction history, activity feed and chain discovery for FNF Wallet (persistence + explorer clients, no signing)"
+description = "Transaction history, activity feed and chain discovery for crypto wallets (persistence + explorer clients, no signing)"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
