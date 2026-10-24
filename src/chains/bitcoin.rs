@@ -16,7 +16,7 @@ use crate::error::{HistoryError, HistoryResult};
 use crate::model::{HistoryKind, HistoryStatus, NewEntry};
 #[cfg(test)]
 use crate::model::now_secs;
-use fnf_registry::model::{ChainInfo, HistoryApi};
+use registry::model::{ChainInfo, HistoryApi};
 use serde::Deserialize;
 
 /// Esplora returns 25 per page. Older history is reachable by paging, but the
@@ -199,7 +199,7 @@ struct Vout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fnf_registry::model::BitcoinChain;
+    use registry::model::BitcoinChain;
 
     const OURS: &str = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa";
 

@@ -11,7 +11,7 @@
 use crate::chains;
 use crate::error::{HistoryResult};
 use crate::model::NewEntry;
-use fnf_registry::model::ChainInfo;
+use registry::model::ChainInfo;
 
 /// One chain plus the address to scan for it.
 #[derive(Debug, Clone)]

@@ -13,7 +13,7 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Chain + token metadata. History resolves symbols and decimals from here
 # rather than duplicating chain data.
-fnf-registry = { version = "0.1.0", path = "../registry" }
+registry = { version = "0.1.0", path = "../registry" }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]

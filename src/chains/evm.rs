@@ -15,7 +15,7 @@
 use super::{clean, epoch, get_json};
 use crate::error::{HistoryError, HistoryResult};
 use crate::model::{HistoryKind, HistoryStatus, NewEntry};
-use fnf_registry::model::{ChainInfo, HistoryApi};
+use registry::model::{ChainInfo, HistoryApi};
 use serde::Deserialize;
 
 /// Blockscout returns 50 per page. One page is the recent history a user opens
@@ -272,7 +272,7 @@ struct InternalRow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fnf_registry::model::EvmChain;
+    use registry::model::EvmChain;
 
     /// Runs a raw JSON literal through a deserializer, the way an explorer's
     /// response would.

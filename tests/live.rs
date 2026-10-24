@@ -6,7 +6,7 @@
 //! endpoint is caught here rather than as an empty activity list on a device.
 
 use fnf_history::discovery::{Discovery, ScanTarget};
-use fnf_registry::model::{BitcoinChain, ChainInfo, EvmChain};
+use registry::model::{BitcoinChain, ChainInfo, EvmChain};
 
 const ETHEREUM: &str = include_str!("../../registry/data/evm/1.json");
 const BITCOIN: &str = include_str!("../../registry/data/bitcoin.json");

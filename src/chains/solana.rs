@@ -12,7 +12,7 @@
 
 use crate::error::{HistoryError, HistoryResult};
 use crate::model::{HistoryKind, HistoryStatus, NewEntry};
-use fnf_registry::model::{ChainInfo, SolanaChain};
+use registry::model::{ChainInfo, SolanaChain};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
@@ -240,7 +240,7 @@ mod tests {
     const TOKEN_RECEIVE: &str = include_str!("testdata/solana_token.json");
 
     fn chain() -> SolanaChain {
-        fnf_registry::chains::builtin_only()
+        registry::chains::builtin_only()
             .into_iter()
             .find_map(|c| match c {
                 ChainInfo::Solana(s) if s.id == "solana" => Some(s),

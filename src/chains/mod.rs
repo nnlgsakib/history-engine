@@ -18,7 +18,7 @@ pub mod solana;
 
 use crate::error::{HistoryResult};
 use crate::model::NewEntry;
-use fnf_registry::model::ChainInfo;
+use registry::model::ChainInfo;
 use std::time::Duration;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
