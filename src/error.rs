@@ -9,6 +9,9 @@ pub enum HistoryError {
     /// Explorer was unreachable or returned junk.
     Source(String),
     Store(String),
+    /// A provider's proxy refused the app's session (missing or expired).
+    /// The app gets a new one and calls `Discovery::set_bearer`.
+    Unauthorized,
 }
 
 impl fmt::Display for HistoryError {
@@ -19,6 +22,7 @@ impl fmt::Display for HistoryError {
             }
             HistoryError::Source(msg) => write!(f, "history source unavailable: {msg}"),
             HistoryError::Store(msg) => write!(f, "history store failed: {msg}"),
+            HistoryError::Unauthorized => write!(f, "history source needs a new session"),
         }
     }
 }

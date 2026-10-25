@@ -11,7 +11,7 @@
 //! received amount is authoritative for the activity feed; the fee is recorded
 //! on the send side so it is not double-counted.
 
-use super::{epoch, get_json};
+use super::get_json;
 use crate::error::{HistoryError, HistoryResult};
 use crate::model::{HistoryKind, HistoryStatus, NewEntry};
 #[cfg(test)]
@@ -58,7 +58,8 @@ fn map_tx(
     if tx.txid.is_empty() {
         return None;
     }
-    let at = epoch(&tx.block_time.map(|t| t.to_string()));
+    // Esplora gives the block time as Unix seconds already.
+    let at = tx.block_time.unwrap_or_else(crate::model::now_secs);
     let status = if tx.status.confirmed {
         HistoryStatus::Confirmed
     } else {
@@ -312,6 +313,22 @@ mod tests {
         assert_eq!(row.status, HistoryStatus::Pending);
         assert!(row.confirmed_at.is_none());
         assert!(row.created_at >= before - 1);
+    }
+
+    /// A confirmed transaction is dated by its block, not by when it was read.
+    #[test]
+    fn confirmed_is_dated_by_its_block() {
+        let tx = EsploraTx {
+            txid: "abc".into(),
+            status: EsploraStatus { confirmed: true },
+            block_time: Some(1_700_000_000),
+            fee: Some(100),
+            vin: vec![vin(OURS, 10_000)],
+            vout: vec![vout("dest", 9_900)],
+        };
+        let row = map_tx("w", &chain(), OURS, &tx).expect("mapped");
+        assert_eq!(row.created_at, 1_700_000_000);
+        assert_eq!(row.confirmed_at, Some(1_700_000_000));
     }
 
     /// Touching our address without moving anything attributable must be

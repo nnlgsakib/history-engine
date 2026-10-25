@@ -17,5 +17,6 @@ pub mod model;
 pub mod store;
 
 pub use error::{HistoryError, HistoryResult};
+pub use discovery::{Discovery, Endpoints, ScanTarget};
 pub use model::{HistoryEntry, HistoryKind, HistoryStatus, KindFilter, NewEntry, Received};
 pub use store::HistoryStore;

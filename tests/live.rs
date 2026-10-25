@@ -11,8 +11,11 @@ use registry::model::{BitcoinChain, ChainInfo, EvmChain};
 const ETHEREUM: &str = include_str!("../../registry/data/evm/1.json");
 const BITCOIN: &str = include_str!("../../registry/data/bitcoin.json");
 
-/// Address with a long public history on Ethereum.
-const ETH_ADDRESS: &str = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
+/// An ordinary active Ethereum address. Blockscout's internal-transactions
+/// endpoint times out for very busy ones (vitalik.eth: over 40 s).
+const ETH_ADDRESS: &str = "0xED9Ab5BC05A0152B9dC2f7902e8369Af7bC18771";
+/// Address with a long public history, for providers that page.
+const BUSY_ADDRESS: &str = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
 /// First ever Bitcoin address, so history is guaranteed non-empty.
 const BTC_ADDRESS: &str = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa";
 
@@ -43,13 +46,15 @@ fn ethereum_token_and_native_transfers_are_readable() {
         assert!(!rows.is_empty(), "expected history for a known address");
         assert!(rows.iter().all(|r| r.tx_hash.is_some()));
         assert!(rows.iter().all(|r| r.decimals > 0));
+        // Real Unix dates. Discovered rows were once dated centuries ahead.
+        assert!(rows.iter().all(|r| r.created_at > 1_400_000_000 && r.created_at < 4_000_000_000));
 
         // Token transfers and native transfers are separate endpoints. If only
         // the first were read this would fail, and incoming ETH would be
         // silently missing in production.
         assert!(
             rows.iter().any(|r| r.asset_id.ends_with(":native")),
-            "native transfers must be read from internal-transactions"
+            "plain coin transfers must be read from transactions"
         );
         assert!(
             rows.iter().any(|r| !r.asset_id.ends_with(":native")),
@@ -100,6 +105,7 @@ fn bitcoin_history_has_real_amounts_and_direction() {
         assert!(!rows.is_empty());
         assert!(rows.iter().all(|r| r.asset_id == "bitcoin:native"));
         assert!(rows.iter().all(|r| r.decimals == 8));
+        assert!(rows.iter().all(|r| r.created_at > 1_230_000_000 && r.created_at < 4_000_000_000), "dated by block");
 
         // Amounts are derived from inputs/outputs, so at least one row must
         // carry a non-zero value. A previous implementation reported every
@@ -144,5 +150,51 @@ fn a_chain_without_a_source_reports_unsupported() {
         unreachable!()
     };
     chain.history_api = None;
-    assert!(!Discovery::supported(&ChainInfo::Evm(chain)));
+    assert!(!Discovery::new("history-engine-tests").unwrap().supports(&ChainInfo::Evm(chain)));
+}
+
+/// Sends and receives through Alchemy, on every chain that declares it.
+/// Needs a key, or an endpoint template naming the network (a proxy):
+///
+///   ALCHEMY_API_KEY=KEY cargo test --test live alchemy -- --ignored --nocapture
+#[test]
+#[ignore]
+fn alchemy_reads_sends_and_receives_on_every_declared_chain() {
+    let template = match (std::env::var("ALCHEMY_HISTORY_URL"), std::env::var("ALCHEMY_API_KEY")) {
+        (Ok(template), _) => template,
+        (_, Ok(key)) => format!("https://{{network}}.g.alchemy.com/v2/{key}"),
+        _ => {
+            println!("ALCHEMY_API_KEY not set: skipped");
+            return;
+        }
+    };
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        let discovery = history_engine::Discovery::with_endpoints(
+            "history-engine-tests",
+            history_engine::Endpoints { alchemy: Some(template) },
+        )
+        .expect("endpoint");
+        for chain in registry::chains::builtin_only() {
+            let ChainInfo::Evm(mut evm) = chain else { continue };
+            // Testnets: the busy address below has no history there.
+            if evm.history_providers.is_empty() || evm.testnet {
+                continue;
+            }
+            // Alchemy alone: a Blockscout fallback would hide a broken provider.
+            evm.history_api = None;
+            let name = evm.name.clone();
+            let store = history_engine::HistoryStore::open(&std::env::temp_dir().join(format!("history-live-{}", evm.id))).unwrap();
+            let target = ScanTarget { wallet_id: "live".into(), chain: ChainInfo::Evm(evm), address: BUSY_ADDRESS.into() };
+            let rows = discovery.scan(&target).await.unwrap_or_else(|e| panic!("{name}: {e}"));
+            let sent = rows.iter().filter(|r| r.kind == history_engine::HistoryKind::Sent).count();
+            let received = rows.len() - sent;
+            println!("{name}: {sent} sent, {received} received");
+            assert!(received > 0, "{name}: a public address this busy has receives");
+            assert!(rows.iter().all(|r| r.created_at > 1_400_000_000 && r.created_at < 4_000_000_000), "{name}: real dates");
+            // A second sync starts from the cursor and adds little or nothing.
+            discovery.sync(&store, &target).await.unwrap();
+            discovery.sync(&store, &target).await.unwrap();
+        }
+    });
 }

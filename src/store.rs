@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Append-only. Never edit an applied entry — add a new one.
 const MIGRATIONS: &[&str] = &[
@@ -62,6 +62,47 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE history ADD COLUMN recv_decimals    INTEGER;
     ALTER TABLE history ADD COLUMN recv_chain_id    TEXT;
     ALTER TABLE history ADD COLUMN recv_chain_name  TEXT;
+    COMMIT;
+    "#,
+    // One row per transfer, not per transaction: a swap or a batch payout
+    // moves several assets under one hash, so the hash is no longer unique.
+    // A local row still wins over a discovered copy (see `record`).
+    //
+    // Discovered rows written before this had wrong dates and ids without
+    // the wallet. They can always be read again from the chain, so they are
+    // dropped and found again on the next refresh. Local rows are kept.
+    //
+    // `history_cursor` is how far each source has read, so a refresh asks
+    // only for what is new.
+    r#"
+    BEGIN;
+    DROP INDEX IF EXISTS history_wallet_hash;
+    CREATE INDEX IF NOT EXISTS history_wallet_tx ON history (wallet_id, tx_hash);
+    DELETE FROM history WHERE discovered = 1;
+    CREATE TABLE IF NOT EXISTS history_cursor (
+        wallet_id TEXT    NOT NULL,
+        chain_id  TEXT    NOT NULL,
+        source    TEXT    NOT NULL,
+        block     INTEGER NOT NULL,
+        PRIMARY KEY (wallet_id, chain_id, source)
+    );
+    COMMIT;
+    "#,
+    // A development build used version 3 for an earlier step that only made
+    // the hash index non-unique, so on those installs the step above never
+    // ran. This one brings both to the same schema, and changes nothing on
+    // a database that has it already.
+    r#"
+    BEGIN;
+    DROP INDEX IF EXISTS history_wallet_hash;
+    CREATE INDEX IF NOT EXISTS history_wallet_tx ON history (wallet_id, tx_hash);
+    CREATE TABLE IF NOT EXISTS history_cursor (
+        wallet_id TEXT    NOT NULL,
+        chain_id  TEXT    NOT NULL,
+        source    TEXT    NOT NULL,
+        block     INTEGER NOT NULL,
+        PRIMARY KEY (wallet_id, chain_id, source)
+    );
     COMMIT;
     "#,
 ];
@@ -185,24 +226,35 @@ impl HistoryStore {
         Ok(())
     }
 
-    /// Records a row. Idempotent by `local_id`, and by `(wallet_id, tx_hash)`
-    /// so a discovered transfer does not duplicate a local send.
+    /// Records a row. Returns whether it was new. Idempotent by `local_id`.
     ///
-    /// An existing row for the same hash is *left alone*: the local record is
-    /// the authority on fee and status, since it knows what this device paid.
-    pub fn record(&self, entry: &NewEntry, discovered: bool) -> HistoryResult<()> {
+    /// A discovered row is stored under `{wallet_id}:{local_id}`, because the
+    /// same transfer is found by every wallet on this phone it touches. It is
+    /// skipped when this wallet already has a local row for the transaction:
+    /// the local record is the authority on fee and status, since it knows
+    /// what this device paid. A local row with a hash removes discovered
+    /// copies of it for the same reason.
+    pub fn record(&self, entry: &NewEntry, discovered: bool) -> HistoryResult<bool> {
+        let local_id = if discovered {
+            format!("{}:{}", entry.wallet_id, entry.local_id)
+        } else {
+            entry.local_id.clone()
+        };
         let conn = lock(&self.conn)?;
-        conn.execute(
+        let inserted = conn.execute(
             "INSERT OR IGNORE INTO history
                (local_id, wallet_id, kind, status, asset_id, symbol, chain_id,
                 chain_name, to_address, amount_base, fee_base, decimals,
                 price_usd, tx_hash, explorer_url, counterparty, error,
                 discovered, created_at, confirmed_at, recv_symbol,
                 recv_amount_base, recv_decimals, recv_chain_id, recv_chain_name)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                     ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
+              WHERE ?18 = 0
+                 OR NOT EXISTS (SELECT 1 FROM history
+                                 WHERE wallet_id = ?2 AND tx_hash = ?14 AND discovered = 0)",
             params![
-                entry.local_id,
+                local_id,
                 entry.wallet_id,
                 entry.kind.as_str(),
                 entry.status.as_str(),
@@ -229,8 +281,14 @@ impl HistoryStore {
                 entry.received.as_ref().map(|r| r.chain_name.as_str()),
             ],
         )
-        .map_err(|_| HistoryError::Store("write failed".into()))?;
-        Ok(())
+        .map_err(|_| HistoryError::Store("write failed".into()))?
+            > 0;
+        if inserted && !discovered {
+            if let Some(hash) = &entry.tx_hash {
+                drop_discovered_copies(&conn, &local_id, hash)?;
+            }
+        }
+        Ok(inserted)
     }
 
     /// Settles a pending local row once the broadcast outcome is known.
@@ -257,6 +315,9 @@ impl HistoryStore {
             params![status.as_str(), tx_hash, explorer_url, error, now_secs(), local_id],
         )
         .map_err(|_| HistoryError::Store("settle failed".into()))?;
+        if let Some(hash) = tx_hash {
+            drop_discovered_copies(&conn, local_id, hash)?;
+        }
         Ok(())
     }
 
@@ -330,6 +391,7 @@ impl HistoryStore {
             params![tx_hash, explorer_url, local_id],
         )
         .map_err(|_| HistoryError::Store("write failed".into()))?;
+        drop_discovered_copies(&conn, local_id, tx_hash)?;
         Ok(())
     }
 
@@ -392,13 +454,55 @@ impl HistoryStore {
         .map_err(|_| HistoryError::Store("asset id update failed".into()))
     }
 
+    /// The last block a source has read for this wallet on this chain.
+    pub fn cursor(&self, wallet_id: &str, chain_id: &str, source: &str) -> HistoryResult<Option<u64>> {
+        let conn = lock(&self.conn)?;
+        conn.query_row(
+            "SELECT block FROM history_cursor WHERE wallet_id = ?1 AND chain_id = ?2 AND source = ?3",
+            params![wallet_id, chain_id, source],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .map(|block| block.and_then(|b| u64::try_from(b).ok()))
+        .map_err(|_| HistoryError::Store("read failed".into()))
+    }
+
+    /// Saves how far a source has read. Called only once that read's rows
+    /// are all stored, so a crash re-reads rather than skips.
+    pub fn set_cursor(&self, wallet_id: &str, chain_id: &str, source: &str, block: u64) -> HistoryResult<()> {
+        let block = i64::try_from(block).map_err(|_| HistoryError::Store("block out of range".into()))?;
+        let conn = lock(&self.conn)?;
+        conn.execute(
+            "INSERT INTO history_cursor (wallet_id, chain_id, source, block) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(wallet_id, chain_id, source) DO UPDATE SET block = excluded.block",
+            params![wallet_id, chain_id, source, block],
+        )
+        .map_err(|_| HistoryError::Store("write failed".into()))?;
+        Ok(())
+    }
+
     /// Removes a wallet's history. For wallet deletion only — never on lock.
     pub fn purge_wallet(&self, wallet_id: &str) -> HistoryResult<()> {
         let conn = lock(&self.conn)?;
         conn.execute("DELETE FROM history WHERE wallet_id = ?1", params![wallet_id])
             .map_err(|_| HistoryError::Store("purge failed".into()))?;
+        conn.execute("DELETE FROM history_cursor WHERE wallet_id = ?1", params![wallet_id])
+            .map_err(|_| HistoryError::Store("purge failed".into()))?;
         Ok(())
     }
+}
+
+/// Removes discovered rows of the transaction a local row now carries, in
+/// that row's wallet only.
+fn drop_discovered_copies(conn: &Connection, local_id: &str, tx_hash: &str) -> HistoryResult<()> {
+    conn.execute(
+        "DELETE FROM history
+          WHERE discovered = 1 AND tx_hash = ?1
+            AND wallet_id = (SELECT wallet_id FROM history WHERE local_id = ?2 AND discovered = 0)",
+        params![tx_hash, local_id],
+    )
+    .map_err(|_| HistoryError::Store("write failed".into()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -559,7 +663,8 @@ mod tests {
         assert_eq!(s.list("w", Some(KindFilter::Sent), 10).unwrap().len(), 1);
         assert_eq!(
             s.list("w", Some(KindFilter::Received), 10).unwrap()[0].local_id,
-            "l2"
+            "w:l2",
+            "discovered ids are scoped by wallet"
         );
         assert_eq!(s.list("w", Some(KindFilter::Swap), 10).unwrap().len(), 1);
     }
@@ -649,11 +754,11 @@ mod tests {
             tx_hash: Some(format!("0x{local}")),
             ..entry("w", local, HistoryKind::Received, "1")
         };
-        store.record(&row("a", "ethereum", "ethereum:native"), true).unwrap();
-        store.record(&row("b", "ethereum", "ethereum:0xa0b8"), true).unwrap();
+        store.record(&row("a", "ethereum", "ethereum:native"), false).unwrap();
+        store.record(&row("b", "ethereum", "ethereum:0xa0b8"), false).unwrap();
         // Already right, and another chain whose id merely starts the same.
-        store.record(&row("c", "ethereum", "evm:1:native"), true).unwrap();
-        store.record(&row("d", "ethereum-classic", "ethereum-classic:native"), true).unwrap();
+        store.record(&row("c", "ethereum", "evm:1:native"), false).unwrap();
+        store.record(&row("d", "ethereum-classic", "ethereum-classic:native"), false).unwrap();
 
         assert_eq!(store.rename_asset_prefix("ethereum", "ethereum", "evm:1").unwrap(), 2);
         let id = |local: &str| store.get(local).unwrap().unwrap().asset_id;
@@ -779,5 +884,169 @@ mod tests {
         let json = serde_json::to_string(&s.list("w", None, 10).unwrap()).unwrap();
         assert!(json.contains("\"kind\":\"sent\""));
         assert!(json.contains("\"discovered\":true"));
+    }
+
+    fn found(wallet: &str, id: &str, hash: &str) -> NewEntry {
+        NewEntry {
+            tx_hash: Some(hash.to_string()),
+            status: HistoryStatus::Confirmed,
+            ..entry(wallet, id, HistoryKind::Received, "7")
+        }
+    }
+
+    /// A transfer between two wallets on this phone is found by both. The
+    /// provider's id is the same for each, so ids must be per wallet.
+    #[test]
+    fn discovered_ids_are_scoped_per_wallet() {
+        let s = store();
+        assert!(s.record(&found("a", "0xh:log:1", "0xh"), true).unwrap());
+        assert!(s.record(&found("b", "0xh:log:1", "0xh"), true).unwrap());
+        assert_eq!(s.list("a", None, 10).unwrap()[0].local_id, "a:0xh:log:1");
+        assert_eq!(s.list("b", None, 10).unwrap()[0].local_id, "b:0xh:log:1");
+    }
+
+    /// One transaction can move several tokens (a swap, a batch payout).
+    #[test]
+    fn several_transfers_in_one_transaction_all_stay() {
+        let s = store();
+        s.record(&found("w", "0xh:log:1", "0xh"), true).unwrap();
+        s.record(&found("w", "0xh:log:2", "0xh"), true).unwrap();
+        assert_eq!(s.list("w", None, 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn record_reports_whether_it_inserted() {
+        let s = store();
+        assert!(s.record(&found("w", "0xh:external", "0xh"), true).unwrap());
+        assert!(!s.record(&found("w", "0xh:external", "0xh"), true).unwrap(), "a re-scan adds nothing");
+        assert!(s.record(&entry("w", "l1", HistoryKind::Sent, "1"), false).unwrap());
+        assert!(!s.record(&entry("w", "l1", HistoryKind::Sent, "1"), false).unwrap());
+    }
+
+    /// Discovery can run between broadcast and settle. When the local send
+    /// gets its hash, the copy found on chain gives way to it: the local row
+    /// knows the fee and is what the app tracks.
+    #[test]
+    fn settling_a_local_send_replaces_the_discovered_copy() {
+        let s = store();
+        s.record(&found("w", "0xh:external", "0xh"), true).unwrap();
+        s.record(&found("other", "0xh:external", "0xh"), true).unwrap();
+        s.record(&entry("w", "quote1", HistoryKind::Sent, "7"), false).unwrap();
+        s.settle("quote1", HistoryStatus::Confirmed, Some("0xh"), None, None).unwrap();
+
+        let rows = s.list("w", None, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].local_id, "quote1");
+        assert_eq!(s.list("other", None, 10).unwrap().len(), 1, "another wallet's copy stays");
+    }
+
+    #[test]
+    fn attaching_a_hash_replaces_the_discovered_copy() {
+        let s = store();
+        s.record(&found("w1", "0xabc:log:3", "0xabc"), true).unwrap();
+        s.record(&swap("s1"), false).unwrap();
+        s.attach_hash("s1", "0xabc", None).unwrap();
+        let rows = s.list("w1", None, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].local_id, "s1");
+    }
+
+    #[test]
+    fn a_local_row_written_with_its_hash_replaces_the_discovered_copy() {
+        let s = store();
+        s.record(&found("w", "0xh:log:1", "0xh"), true).unwrap();
+        let mut local = entry("w", "dapp1", HistoryKind::Sent, "7");
+        local.tx_hash = Some("0xh".into());
+        s.record(&local, false).unwrap();
+        let rows = s.list("w", None, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].local_id, "dapp1");
+    }
+
+    #[test]
+    fn cursor_is_kept_per_wallet_chain_and_source() {
+        let s = store();
+        assert_eq!(s.cursor("w", "ethereum", "alchemy").unwrap(), None);
+        s.set_cursor("w", "ethereum", "alchemy", 100).unwrap();
+        s.set_cursor("w", "ethereum", "alchemy", 250).unwrap();
+        assert_eq!(s.cursor("w", "ethereum", "alchemy").unwrap(), Some(250));
+        assert_eq!(s.cursor("w", "polygon", "alchemy").unwrap(), None);
+        assert_eq!(s.cursor("w", "ethereum", "other").unwrap(), None);
+        assert_eq!(s.cursor("x", "ethereum", "alchemy").unwrap(), None);
+    }
+
+    #[test]
+    fn purge_also_forgets_the_wallets_cursors() {
+        let s = store();
+        s.set_cursor("a", "ethereum", "alchemy", 9).unwrap();
+        s.set_cursor("b", "ethereum", "alchemy", 9).unwrap();
+        s.purge_wallet("a").unwrap();
+        assert_eq!(s.cursor("a", "ethereum", "alchemy").unwrap(), None);
+        assert_eq!(s.cursor("b", "ethereum", "alchemy").unwrap(), Some(9));
+    }
+
+    /// An earlier, unreleased version 3 (a development build) only dropped
+    /// the unique hash index. Version 4 brings it to the same schema: the
+    /// cursor table, and several transfers per transaction.
+    #[test]
+    fn the_other_version_3_upgrades_to_a_working_store() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.execute_batch(MIGRATIONS[1]).unwrap();
+        conn.execute_batch(
+            "BEGIN;
+             DROP INDEX IF EXISTS history_wallet_hash;
+             DELETE FROM history WHERE discovered = 1;
+             CREATE INDEX IF NOT EXISTS history_wallet_hash ON history (wallet_id, tx_hash);
+             COMMIT;
+             INSERT INTO history_meta (key, value) VALUES ('schema_version', '3');",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO history (local_id, wallet_id, kind, status, asset_id, symbol, chain_id,
+                                  chain_name, to_address, amount_base, decimals, created_at, tx_hash)
+             VALUES ('mine', 'w', 'sent', 'confirmed', 'evm:56:native', 'BNB', 'bnb', 'BNB Chain', '0xabc', '1', 18, 5, '0x1')",
+            [],
+        )
+        .unwrap();
+
+        HistoryStore::migrate(&mut conn).expect("upgrade");
+        let s = HistoryStore { conn: Mutex::new(conn) };
+        s.set_cursor("w", "bnb", "alchemy", 7).expect("cursor table exists");
+        assert_eq!(s.cursor("w", "bnb", "alchemy").unwrap(), Some(7));
+        s.record(&found("w", "0x2:a", "0x2"), true).unwrap();
+        s.record(&found("w", "0x2:b", "0x2"), true).unwrap();
+        assert_eq!(s.list("w", None, 10).unwrap().len(), 3, "kept the send, both transfers stored");
+    }
+
+    /// Rows found before this version carry wrong dates and wallet-less ids.
+    /// They can be read again from the chain, so the upgrade drops them; what
+    /// this device sent is kept.
+    #[test]
+    fn upgrade_drops_discovered_rows_and_keeps_local_ones() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.execute_batch(MIGRATIONS[1]).unwrap();
+        conn.execute("INSERT INTO history_meta (key, value) VALUES ('schema_version', '2')", []).unwrap();
+        for (id, discovered, hash) in [("mine", 0, "0x1"), ("seen", 1, "0x2")] {
+            conn.execute(
+                "INSERT INTO history (local_id, wallet_id, kind, status, asset_id, symbol, chain_id,
+                                      chain_name, to_address, amount_base, decimals, created_at,
+                                      discovered, tx_hash)
+                 VALUES (?1, 'w', 'sent', 'confirmed', 'evm:1:native', 'ETH', 'ethereum',
+                         'Ethereum', '0xabc', '1', 18, 5, ?2, ?3)",
+                params![id, discovered, hash],
+            )
+            .unwrap();
+        }
+        HistoryStore::migrate(&mut conn).expect("upgrade");
+        let s = HistoryStore { conn: Mutex::new(conn) };
+
+        let rows = s.list("w", None, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].local_id, "mine");
+        s.record(&found("w", "0x2:log:1", "0x2"), true).unwrap();
+        s.record(&found("w", "0x2:log:2", "0x2"), true).unwrap();
+        assert_eq!(s.list("w", None, 10).unwrap().len(), 3);
     }
 }

@@ -1,16 +1,17 @@
-//! EVM history via Blockscout.
+//! EVM history via Blockscout, the keyless source.
 //!
-//! Account model: a transaction's direction is simply whether our address is
-//! the sender, and balances are readable at any moment.
+//! Account model: a transfer's direction is whether our address sent it.
 //!
-//! The trap here is that Blockscout splits history across **two** endpoints
-//! that do not overlap:
+//! Blockscout splits history across **three** endpoints that do not overlap:
 //!
-//! - `token-transfers` — ERC-20/721/1155 movements.
-//! - `internal-transactions?filter=to` — plain native coin transfers.
+//! - `transactions` — top-level transactions. Every ordinary coin payment,
+//!   in or out, is one of these.
+//! - `internal-transactions` — coin moved by a contract (a withdrawal, a
+//!   bridge payout). Inbound only (`filter=to`).
+//! - `token-transfers` — ERC-20 movements.
 //!
-//! Most incoming value is in the second one. Fetching only the first looks
-//! like it works while quietly missing most deposits, so both are read.
+//! Reading only the last two looks like it works while missing every plain
+//! deposit, so all three are read.
 
 use super::{clean, epoch, get_json};
 use crate::error::{HistoryError, HistoryResult};
@@ -18,10 +19,9 @@ use crate::model::{HistoryKind, HistoryStatus, NewEntry};
 use registry::model::{ChainInfo, HistoryApi};
 use serde::Deserialize;
 
-/// Blockscout returns 50 per page. One page is the recent history a user opens
-/// the activity screen for; deeper paging is added only if it proves needed.
-const MAX_TOKEN_ROWS: usize = 50;
-const MAX_NATIVE_ROWS: usize = 50;
+/// Blockscout returns 50 per page. One page per endpoint is the recent
+/// history; deeper history needs a source with a cursor (Alchemy).
+const MAX_ROWS: usize = 50;
 
 pub async fn read(
     client: &reqwest::Client,
@@ -39,116 +39,35 @@ pub async fn read(
     let base = base_url.trim_end_matches('/');
     let addr = address.to_lowercase();
 
-    // Both endpoints are required, and both failures are surfaced. Swallowing
-    // one would show an activity feed missing every token transfer while
-    // looking entirely plausible.
-    let (tokens, natives) = futures_util::future::join(
-        token_transfers(client, base, &addr),
-        internal_transfers(client, base, &addr),
+    // Every endpoint is required, and every failure is surfaced. Swallowing
+    // one would show a feed missing a whole kind of transfer while looking
+    // entirely plausible.
+    let (txs, natives, tokens) = futures_util::future::join3(
+        get_json::<TxPage>(client, &format!("{base}/api/v2/addresses/{addr}/transactions")),
+        get_json::<InternalPage>(client, &format!("{base}/api/v2/addresses/{addr}/internal-transactions?filter=to")),
+        get_json::<TokenPage>(client, &format!("{base}/api/v2/addresses/{addr}/token-transfers")),
     )
     .await;
-    let tokens = tokens?;
-    let natives = natives?;
 
-    let mut out: Vec<NewEntry> = tokens
+    let mut out: Vec<NewEntry> = txs?
+        .items
         .into_iter()
-        .filter_map(|row| map_token(wallet_id, chain, address, row))
+        .take(MAX_ROWS)
+        .filter_map(|row| map_tx(wallet_id, chain, address, row))
         .collect();
-    out.extend(
-        natives
-            .into_iter()
-            .filter_map(|row| map_native(wallet_id, chain, address, row)),
-    );
+    out.extend(natives?.items.into_iter().take(MAX_ROWS).filter_map(|row| map_native(wallet_id, chain, address, row)));
+    out.extend(tokens?.items.into_iter().take(MAX_ROWS).filter_map(|row| map_token(wallet_id, chain, address, row)));
     Ok(out)
 }
 
-async fn token_transfers(
-    client: &reqwest::Client,
-    base: &str,
-    address: &str,
-) -> HistoryResult<Vec<TokenRow>> {
-    let url = format!("{base}/api/v2/addresses/{address}/token-transfers");
-    let page: TokenPage = get_json(client, &url).await?;
-    Ok(page.items.into_iter().take(MAX_TOKEN_ROWS).collect())
-}
-
-async fn internal_transfers(
-    client: &reqwest::Client,
-    base: &str,
-    address: &str,
-) -> HistoryResult<Vec<InternalRow>> {
-    // `filter=to` restricts to incoming, so every row is inbound to us.
-    let url = format!("{base}/api/v2/addresses/{address}/internal-transactions?filter=to");
-    let page: InternalPage = get_json(client, &url).await?;
-    Ok(page.items.into_iter().take(MAX_NATIVE_ROWS).collect())
-}
-
-/// ERC-20/721/1155 movement.
-fn map_token(
-    wallet_id: &str,
-    chain: &ChainInfo,
-    our_address: &str,
-    row: TokenRow,
-) -> Option<NewEntry> {
-    let hash = row.transaction_hash.clone()?;
-    // An unknown decimals value cannot be rendered safely, so the row is
-    // dropped rather than guessed at.
-    let decimals = row.token.decimals?;
-    let raw = row.total.value?;
-    let symbol = clean(&row.token.symbol.clone().unwrap_or_default(), 16);
-    if symbol.is_empty() {
-        return None;
-    }
-
-    let outgoing = row
-        .from
-        .hash
-        .as_deref()
-        .map(|h| h.eq_ignore_ascii_case(our_address))
-        .unwrap_or(false);
-    let counterparty = if outgoing {
-        row.to.hash.clone()
-    } else {
-        row.from.hash.clone()
-    };
-    let at = epoch(&row.timestamp);
-
-    Some(NewEntry {
-        wallet_id: wallet_id.to_string(),
-        // Hash + symbol, so two token transfers in one transaction stay
-        // distinct rows.
-        local_id: format!("{hash}:{symbol}"),
-        kind: if outgoing {
-            HistoryKind::Sent
-        } else {
-            HistoryKind::Received
-        },
-        status: HistoryStatus::Confirmed,
-        asset_id: format!(
-            "{}:{}",
-            asset_prefix(chain),
-            row.token
-                .address
-                .clone()
-                .unwrap_or_default()
-                .to_lowercase()
-        ),
-        symbol,
-        chain_id: chain.id().to_string(),
-        chain_name: chain.name().to_string(),
-        to_address: counterparty.clone().unwrap_or_default(),
-        amount_base: raw,
-        fee_base: "0".to_string(),
-        decimals,
-        price_usd: 0.0,
-        tx_hash: Some(hash),
-        explorer_url: None,
-        counterparty,
-        error: None,
-        created_at: at,
-        confirmed_at: Some(at),
-        received: None,
-    })
+/// A transfer's id, the same whichever source read it, so one source can
+/// stand in for another without doubling rows.
+///
+/// ponytail: two identical transfers (same asset, direction and amount) in
+/// one transaction read as one row. Rare; key on the log index if every
+/// source ever exposes it the same way.
+pub(crate) fn transfer_id(hash: &str, asset_id: &str, kind: HistoryKind, amount: &str) -> String {
+    format!("{}:{asset_id}:{}:{amount}", hash.to_lowercase(), kind.as_str())
 }
 
 /// The start of an asset id on this chain, as the wallet writes them:
@@ -161,43 +80,171 @@ pub(crate) fn asset_prefix(chain: &ChainInfo) -> String {
     }
 }
 
-/// Plain native-coin transfer. Always received: the endpoint filters `to`.
-fn map_native(
-    wallet_id: &str,
-    chain: &ChainInfo,
-    our_address: &str,
-    row: InternalRow,
-) -> Option<NewEntry> {
-    let hash = row.transaction_hash.clone()?;
-    let raw = row.value.clone()?;
-    let symbol = clean(&chain.native_currency().symbol, 16);
-    let at = epoch(&row.timestamp);
+/// What every EVM source knows about one transfer, before it becomes a row.
+pub(crate) struct Transfer<'a> {
+    pub hash: String,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    /// Token contract; `None` for the chain's coin.
+    pub token: Option<String>,
+    pub symbol: String,
+    pub decimals: u8,
+    /// Base units, decimal digits.
+    pub amount: String,
+    pub at: i64,
+    pub our_address: &'a str,
+}
 
-    Some(NewEntry {
+/// One row from a transfer. Direction is whether we sent it; a payment to
+/// ourselves reads as sent.
+pub(crate) fn row(wallet_id: &str, chain: &ChainInfo, t: Transfer<'_>) -> NewEntry {
+    let outgoing = t.from.as_deref().is_some_and(|f| f.eq_ignore_ascii_case(t.our_address));
+    let kind = if outgoing { HistoryKind::Sent } else { HistoryKind::Received };
+    let asset_id = match &t.token {
+        Some(contract) => format!("{}:{}", asset_prefix(chain), contract.to_lowercase()),
+        None => format!("{}:native", asset_prefix(chain)),
+    };
+    let (to_address, counterparty) = if outgoing {
+        (t.to.clone().unwrap_or_default(), t.to)
+    } else {
+        (t.our_address.to_string(), t.from)
+    };
+    NewEntry {
         wallet_id: wallet_id.to_string(),
-        local_id: format!("{hash}:{symbol}"),
-        kind: HistoryKind::Received,
+        local_id: transfer_id(&t.hash, &asset_id, kind, &t.amount),
+        kind,
         status: HistoryStatus::Confirmed,
-        asset_id: format!("{}:native", asset_prefix(chain)),
-        symbol,
+        asset_id,
+        symbol: t.symbol,
         chain_id: chain.id().to_string(),
         chain_name: chain.name().to_string(),
-        to_address: our_address.to_string(),
-        amount_base: raw,
+        to_address: clean(&to_address, 100),
+        amount_base: t.amount,
         fee_base: "0".to_string(),
-        decimals: chain.native_currency().decimals,
+        decimals: t.decimals,
         price_usd: 0.0,
-        tx_hash: Some(hash),
+        tx_hash: Some(t.hash),
         explorer_url: None,
-        counterparty: row.from.hash.clone(),
+        counterparty: counterparty.map(|c| clean(&c, 100)),
         error: None,
-        created_at: at,
-        confirmed_at: Some(at),
+        created_at: t.at,
+        confirmed_at: Some(t.at),
         received: None,
-    })
+    }
+}
+
+/// A base-unit amount that moved something: digits only, not zero.
+pub(crate) fn moved(raw: &str) -> bool {
+    !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()) && raw.bytes().any(|b| b != b'0')
+}
+
+/// Top-level transaction: a plain coin payment in or out. Only a mined,
+/// successful one with a value moved anything.
+fn map_tx(wallet_id: &str, chain: &ChainInfo, our_address: &str, tx: TxRow) -> Option<NewEntry> {
+    if tx.status.as_deref() != Some("ok") {
+        return None;
+    }
+    let value = tx.value.filter(|v| moved(v))?;
+    let native = chain.native_currency();
+    Some(row(
+        wallet_id,
+        chain,
+        Transfer {
+            hash: clean(&tx.hash?, 100),
+            from: tx.from.hash,
+            to: tx.to.hash,
+            token: None,
+            symbol: clean(&native.symbol, 16),
+            decimals: native.decimals,
+            amount: value,
+            at: epoch(&tx.timestamp),
+            our_address,
+        },
+    ))
+}
+
+/// Coin moved to us by a contract. Always received: the endpoint filters `to`.
+fn map_native(wallet_id: &str, chain: &ChainInfo, our_address: &str, r: InternalRow) -> Option<NewEntry> {
+    // A failed internal call moved nothing, whatever its value says.
+    if r.success == Some(false) {
+        return None;
+    }
+    let value = r.value.filter(|v| moved(v))?;
+    let native = chain.native_currency();
+    Some(row(
+        wallet_id,
+        chain,
+        Transfer {
+            hash: clean(&r.transaction_hash?, 100),
+            from: r.from.hash,
+            to: Some(our_address.to_string()),
+            token: None,
+            symbol: clean(&native.symbol, 16),
+            decimals: native.decimals,
+            amount: value,
+            at: epoch(&r.timestamp),
+            our_address,
+        },
+    ))
+}
+
+/// ERC-20 movement. NFTs (no decimals) are left out of Activity.
+fn map_token(wallet_id: &str, chain: &ChainInfo, our_address: &str, r: TokenRow) -> Option<NewEntry> {
+    // An unknown decimals value cannot be rendered safely, so the row is
+    // dropped rather than guessed at.
+    let decimals = r.token.decimals?;
+    let amount = r.total.value.filter(|v| moved(v))?;
+    let symbol = clean(&r.token.symbol.unwrap_or_default(), 16);
+    if symbol.is_empty() {
+        return None;
+    }
+    Some(row(
+        wallet_id,
+        chain,
+        Transfer {
+            hash: clean(&r.transaction_hash?, 100),
+            from: r.from.hash,
+            to: r.to.hash,
+            token: Some(clean(&r.token.address.unwrap_or_default(), 100)),
+            symbol,
+            decimals,
+            amount,
+            at: epoch(&r.timestamp),
+            our_address,
+        },
+    ))
 }
 
 // ---- Blockscout wire types -------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct TxPage {
+    #[serde(default)]
+    items: Vec<TxRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TxRow {
+    #[serde(default)]
+    hash: Option<String>,
+    #[serde(default, deserialize_with = "addr_or_null")]
+    from: AddrRef,
+    /// `null` for a contract creation.
+    #[serde(default, deserialize_with = "addr_or_null")]
+    to: AddrRef,
+    /// Base units (wei).
+    #[serde(default)]
+    value: Option<String>,
+    /// `ok`, `error`, or `null` while pending.
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    timestamp: Option<String>,
+}
+
+fn addr_or_null<'de, D: serde::Deserializer<'de>>(d: D) -> Result<AddrRef, D::Error> {
+    Ok(Option::<AddrRef>::deserialize(d)?.unwrap_or_default())
+}
 
 #[derive(Debug, Deserialize)]
 struct TokenPage {
@@ -207,9 +254,9 @@ struct TokenPage {
 
 #[derive(Debug, Deserialize)]
 struct TokenRow {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "addr_or_null")]
     from: AddrRef,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "addr_or_null")]
     to: AddrRef,
     token: Token,
     #[serde(default)]
@@ -252,21 +299,21 @@ struct InternalPage {
 
 #[derive(Debug, Deserialize)]
 struct InternalRow {
-    /// Endpoint is queried with `filter=to`, so this is always us. Unused
-    /// today, but asserting it later is cheaper than discovering the filter
-    /// changed.
-    #[serde(default)]
+    /// Endpoint is queried with `filter=to`, so this is always us.
+    #[serde(default, deserialize_with = "addr_or_null")]
     #[allow(dead_code)]
     to: AddrRef,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "addr_or_null")]
     from: AddrRef,
-    /// Base units (wei) for native transfers.
+    /// Base units (wei).
     #[serde(default)]
     value: Option<String>,
     #[serde(default)]
     transaction_hash: Option<String>,
     #[serde(default)]
     timestamp: Option<String>,
+    #[serde(default)]
+    success: Option<bool>,
 }
 
 #[cfg(test)]
@@ -307,7 +354,7 @@ mod tests {
             token: Token {
                 symbol: Some(symbol.to_string()),
                 decimals: Some(6),
-                address: Some("0xToken".to_string()),
+                address: Some(format!("0x{symbol}")),
             },
             total: Total {
                 value: Some("2500000".to_string()),
@@ -324,7 +371,7 @@ mod tests {
         assert_eq!(row.kind, HistoryKind::Received);
         assert_eq!(row.amount_base, "2500000");
         assert_eq!(row.decimals, 6);
-        assert_eq!(row.asset_id, "evm:1:0xtoken");
+        assert_eq!(row.asset_id, "evm:1:0xusdc");
         assert_eq!(row.counterparty.as_deref(), Some("0xother"));
     }
 
@@ -372,6 +419,7 @@ mod tests {
             value: Some("1000000000000000000".into()),
             transaction_hash: Some("0xn".into()),
             timestamp: Some("2026-10-08T06:44:59Z".into()),
+            success: Some(true),
         };
         let mapped = map_native("w", &chain(), "0xabc", row).expect("mapped");
         assert_eq!(mapped.kind, HistoryKind::Received);
@@ -389,6 +437,7 @@ mod tests {
             value: None,
             transaction_hash: Some("0xn".into()),
             timestamp: None,
+            success: Some(true),
         };
         assert!(map_native("w", &chain(), "0xabc", row).is_none());
     }
@@ -451,5 +500,94 @@ mod tests {
         let client = super::super::http_client("history-engine-tests").expect("client");
         let err = runtime.block_on(read(&client, "w", &ChainInfo::Evm(evm), "0xabc")).expect_err("must refuse");
         assert!(matches!(err, HistoryError::Unsupported(_)));
+    }
+
+    fn tx_row(from: &str, to: &str, value: &str, status: Option<&str>) -> TxRow {
+        TxRow {
+            hash: Some("0xtop".into()),
+            from: AddrRef { hash: Some(from.into()) },
+            to: AddrRef { hash: Some(to.into()) },
+            value: Some(value.into()),
+            status: status.map(str::to_string),
+            timestamp: Some("2026-10-08T06:44:59.000000Z".into()),
+        }
+    }
+
+    /// A plain coin payment is a top-level transaction, not an internal one.
+    /// Reading only internal transactions missed every ordinary deposit.
+    #[test]
+    fn a_plain_coin_payment_in_is_received() {
+        let row = map_tx("w", &chain(), "0xABC", tx_row("0xsender", "0xabc", "500", Some("ok"))).expect("mapped");
+        assert_eq!(row.kind, HistoryKind::Received);
+        assert_eq!(row.asset_id, "evm:1:native");
+        assert_eq!(row.amount_base, "500");
+        assert_eq!(row.decimals, 18);
+        assert_eq!(row.counterparty.as_deref(), Some("0xsender"));
+        assert_eq!(row.to_address, "0xABC");
+        assert_eq!(row.created_at, 1_791_441_899, "dated by its block");
+    }
+
+    #[test]
+    fn a_plain_coin_payment_out_is_sent() {
+        let row = map_tx("w", &chain(), "0xabc", tx_row("0xABC", "0xdest", "500", Some("ok"))).expect("mapped");
+        assert_eq!(row.kind, HistoryKind::Sent);
+        assert_eq!(row.to_address, "0xdest");
+        assert_eq!(row.counterparty.as_deref(), Some("0xdest"));
+    }
+
+    /// Nothing moved: a reverted transaction, one still pending, a contract
+    /// call that carried no coin.
+    #[test]
+    fn transactions_that_moved_no_coin_make_no_row() {
+        assert!(map_tx("w", &chain(), "0xabc", tx_row("0xo", "0xabc", "500", Some("error"))).is_none());
+        assert!(map_tx("w", &chain(), "0xabc", tx_row("0xo", "0xabc", "500", None)).is_none());
+        assert!(map_tx("w", &chain(), "0xabc", tx_row("0xabc", "0xc", "0", Some("ok"))).is_none());
+    }
+
+    #[test]
+    fn a_failed_internal_transfer_makes_no_row() {
+        let row = InternalRow {
+            to: AddrRef { hash: Some("0xabc".into()) },
+            from: AddrRef { hash: Some("0xcontract".into()) },
+            value: Some("5".into()),
+            transaction_hash: Some("0xi".into()),
+            timestamp: None,
+            success: Some(false),
+        };
+        assert!(map_native("w", &chain(), "0xabc", row).is_none());
+    }
+
+    /// The id is built from what moved, so the same transfer read from two
+    /// sources (one standing in for the other) is one row, not two.
+    #[test]
+    fn transfer_ids_come_from_what_moved() {
+        let a = map_token("w", &chain(), "0xabc", token_row(Some("0xo"), Some("0xabc"), "USDC")).unwrap();
+        assert_eq!(a.local_id, "0xhash:evm:1:0xusdc:received:2500000");
+        assert_eq!(transfer_id("0xHASH", "evm:1:native", HistoryKind::Sent, "9"), "0xhash:evm:1:native:sent:9");
+    }
+
+    #[test]
+    fn blockscout_transaction_shape_is_handled() {
+        let raw = r#"{ "items": [{
+            "hash": "0xtop",
+            "from": { "hash": "0xSender" },
+            "to": { "hash": "0xabc" },
+            "value": "1000000000000000000",
+            "status": "ok",
+            "result": "success",
+            "timestamp": "2026-10-08T06:44:59.000000Z"
+        }, {
+            "hash": "0xdeploy",
+            "from": { "hash": "0xabc" },
+            "to": null,
+            "value": "0",
+            "status": "ok",
+            "timestamp": "2026-10-08T06:44:59.000000Z"
+        }] }"#;
+        let page: TxPage = serde_json::from_str(raw).expect("must parse real shape");
+        let rows: Vec<_> = page.items.into_iter().filter_map(|r| map_tx("w", &chain(), "0xabc", r)).collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].amount_base, "1000000000000000000");
+        assert_eq!(rows[0].kind, HistoryKind::Received);
     }
 }
