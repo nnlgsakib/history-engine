@@ -43,7 +43,7 @@ pub struct Discovery {
 
 impl Discovery {
     /// Keyless sources only. `user_agent` identifies the wallet to the
-    /// explorers it reads, e.g. `"Nira Wallet/1.0 (+https://example.com)"`.
+    /// explorers it reads, e.g. `"Example Wallet/1.0 (+https://example.com)"`.
     pub fn new(user_agent: &str) -> HistoryResult<Discovery> {
         Self::with_endpoints(user_agent, Endpoints::default())
     }
